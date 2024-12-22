@@ -1,0 +1,132 @@
+// Smart Parking System for STM32 Microcontroller
+// Features: Real-time Display Updates, Data Logging
+
+#include "stm32f4xx.h"
+#include "lcd.h"      // Include library for LCD display
+#include "rfid.h"     // Include library for RFID module
+#include "timers.h"   // Include library for timers and delays
+#include "flash.h"    // Include library for Flash memory operations
+
+#define MAX_PARKING_SPOTS 10
+
+// Data structure for parking log
+typedef struct {
+    uint32_t RFID_ID;
+    uint32_t entryTime;
+    uint32_t exitTime;
+} ParkingLog;
+
+ParkingLog logs[MAX_PARKING_SPOTS];
+uint8_t parkingAvailability[MAX_PARKING_SPOTS] = {0}; // 0 = available, 1 = occupied
+uint32_t logIndex = 0;
+
+// Function prototypes
+void SystemClock_Config(void);
+void initHardware(void);
+void displayParkingStatus(void);
+void logParkingData(uint32_t RFID_ID, uint32_t entryTime, uint32_t exitTime);
+void delay_ms(uint32_t ms); // Assembly delay subroutine
+void EXTI15_10_IRQHandler(void); // Interrupt handler for car detection
+
+__asm void delay_ms(uint32_t ms) {
+    MOV R1, #16000       // Assuming 16 MHz clock, 1 ms = 16000 cycles
+LOOP:
+    SUB R1, R1, #1      // Decrement counter
+    CMP R1, #0          // Check if counter is zero
+    BNE LOOP            // If not zero, repeat
+    SUB R0, R0, #1      // Decrement ms
+    CMP R0, #0          // Check if ms is zero
+    BNE delay_ms        // If not zero, repeat
+    BX LR               // Return from subroutine
+}
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    initHardware();
+
+    while (1) {
+        displayParkingStatus();
+        delay_ms(500); // Update display every 500 ms
+    }
+}
+
+void SystemClock_Config(void) {
+    // Configure the system clock (placeholder function, specific to STM32 model)
+}
+
+void initHardware(void) {
+    LCD_Init(); // Initialize LCD
+    RFID_Init(); // Initialize RFID module
+    Timer_Init(); // Initialize timers for delay subroutines
+
+    // Configure GPIO pins for sensors and LEDs
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    GPIO_InitStruct.Pin = GPIO_PIN_10 | GPIO_PIN_11;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING; // Interrupt mode for car detection
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+void displayParkingStatus(void) {
+    LCD_Clear();
+    LCD_Print("Parking Status:\n");
+    for (int i = 0; i < MAX_PARKING_SPOTS; i++) {
+        LCD_Print("Spot %d: %s\n", i + 1, parkingAvailability[i] ? "Occupied" : "Available");
+    }
+}
+
+void logParkingData(uint32_t RFID_ID, uint32_t entryTime, uint32_t exitTime) {
+    HAL_FLASH_Unlock();
+
+    if (logIndex < MAX_PARKING_SPOTS) {
+        logs[logIndex].RFID_ID = RFID_ID;
+        logs[logIndex].entryTime = entryTime;
+        logs[logIndex].exitTime = exitTime;
+
+        // Write data to Flash memory
+        uint32_t address = FLASH_USER_START_ADDR + (logIndex * sizeof(ParkingLog));
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, address, *(uint32_t *)&logs[logIndex]);
+
+        logIndex++;
+    }
+
+    HAL_FLASH_Lock();
+}
+
+void EXTI15_10_IRQHandler(void) {
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_10)) {
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_10);
+        uint32_t RFID_ID = RFID_Read();
+        uint32_t entryTime = Timer_GetCurrentTime();
+
+        // Find an available parking spot
+        for (int i = 0; i < MAX_PARKING_SPOTS; i++) {
+            if (!parkingAvailability[i]) {
+                parkingAvailability[i] = 1; // Mark spot as occupied
+                logParkingData(RFID_ID, entryTime, 0);
+                break;
+            }
+        }
+    }
+
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_11)) {
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_11);
+        uint32_t RFID_ID = RFID_Read();
+        uint32_t exitTime = Timer_GetCurrentTime();
+
+        // Find the corresponding log
+        for (int i = 0; i < logIndex; i++) {
+            if (logs[i].RFID_ID == RFID_ID && logs[i].exitTime == 0) {
+                logs[i].exitTime = exitTime;
+                parkingAvailability[i] = 0; // Mark spot as available
+                break;
+            }
+        }
+    }
+}
