@@ -1,0 +1,153 @@
+// Smart Parking System for STM32 Microcontroller
+// Features: Real-time Display Updates, Data Logging
+
+#include "stm32f4xx.h"
+#include "lcd.h"      // Include library for LCD display
+#include "rfid.h"     // Include library for RFID module
+#include "timers.h"   // Include library for timers and delays
+#include "flash.h"    // Include library for Flash memory operations
+
+#define MAX_PARKING_SPOTS 10
+
+// Data structure for parking log
+typedef struct {
+    uint32_t RFID_ID;
+    uint32_t entryTime;
+    uint32_t exitTime;
+} ParkingLog;
+
+ParkingLog logs[MAX_PARKING_SPOTS];
+uint8_t parkingAvailability[MAX_PARKING_SPOTS] = {0}; // 0 = available, 1 = occupied
+uint32_t logIndex = 0;
+
+// Function prototypes
+void SystemClock_Config(void);
+void initHardware(void);
+void displayParkingStatus(void);
+void logParkingData(uint32_t RFID_ID, uint32_t entryTime, uint32_t exitTime);
+void delay_ms(uint32_t ms); // Assembly delay subroutine
+void EXTI15_10_IRQHandler(void); // Interrupt handler for car detection
+
+// Assembly delay subroutine
+__asm void delay_ms(uint32_t ms) {
+    MOV R1, #16000       // Assuming 16 MHz clock, 1 ms = 16000 cycles
+LOOP:
+    SUB R1, R1, #1      // Decrement counter
+    CMP R1, #0          // Check if counter is zero
+    BNE LOOP            // If not zero, repeat
+    SUB R0, R0, #1      // Decrement ms
+    CMP R0, #0          // Check if ms is zero
+    BNE delay_ms        // If not zero, repeat
+    BX LR               // Return from subroutine
+}
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    initHardware();
+
+    while (1) {
+        displayParkingStatus();
+        delay_ms(500); // Update display every 500 ms
+    }
+}
+
+void SystemClock_Config(void) {
+    // Configure the system clock (placeholder function, specific to STM32 model)
+}
+
+void initHardware(void) {
+    LCD_Init(); // Initialize LCD
+    RFID_Init(); // Initialize RFID module
+    Timer_Init(); // Initialize timers for delay subroutines
+
+    // Configure GPIO pins for sensors and LEDs
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN; // Enable GPIOB clock
+
+    GPIOB->MODER &= ~((3UL << (2 * 10)) | (3UL << (2 * 11))); // Clear mode for Pin 10 and 11
+    GPIOB->MODER |= ((0UL << (2 * 10)) | (0UL << (2 * 11)));  // Set Pin 10 and 11 as input
+
+    GPIOB->PUPDR &= ~((3UL << (2 * 10)) | (3UL << (2 * 11))); // No pull-up, no pull-down
+    GPIOB->PUPDR |= ((1UL << (2 * 10)) | (1UL << (2 * 11)));  // Enable pull-up for Pin 10 and 11
+
+    // Configure EXTI for Pin 10 and 11
+    SYSCFG->EXTICR[2] |= SYSCFG_EXTICR3_EXTI10_PB | SYSCFG_EXTICR3_EXTI11_PB;
+    EXTI->IMR |= EXTI_IMR_IM10 | EXTI_IMR_IM11; // Enable interrupt for Pin 10 and 11
+    EXTI->FTSR |= EXTI_FTSR_TR10 | EXTI_FTSR_TR11; // Falling edge trigger
+
+    NVIC_SetPriority(EXTI15_10_IRQn, 2);
+    NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+void displayParkingStatus(void) {
+    LCD_Clear();
+    LCD_Print("Parking Status:\n");
+    for (int i = 0; i < MAX_PARKING_SPOTS; i++) {
+        LCD_Print("Spot %d: %s\n", i + 1, parkingAvailability[i] ? "Occupied" : "Available");
+    }
+}
+
+void logParkingData(uint32_t RFID_ID, uint32_t entryTime, uint32_t exitTime) {
+    // Manual Flash memory access for logging
+    uint32_t *flash_address = (uint32_t *)(0x08020000 + (logIndex * sizeof(ParkingLog)));
+    uint32_t data[3] = {RFID_ID, entryTime, exitTime};
+
+    // Unlock Flash
+    FLASH->KEYR = FLASH_KEY1;
+    FLASH->KEYR = FLASH_KEY2;
+
+    // Erase sector if needed (sector must be empty before writing)
+    FLASH->CR |= FLASH_CR_SER;
+    FLASH->CR |= (5 << FLASH_CR_SNB_Pos); // Assuming Sector 5
+    FLASH->CR |= FLASH_CR_STRT;
+    while (FLASH->SR & FLASH_SR_BSY); // Wait for erase to complete
+
+    // Program Flash
+    FLASH->CR &= ~FLASH_CR_SER;
+    FLASH->CR |= FLASH_CR_PG;
+    for (int i = 0; i < 3; i++) {
+        *flash_address++ = data[i];
+        while (FLASH->SR & FLASH_SR_BSY); // Wait for write to complete
+    }
+
+    // Lock Flash
+    FLASH->CR |= FLASH_CR_LOCK;
+
+    // Update in-memory log
+    logs[logIndex].RFID_ID = RFID_ID;
+    logs[logIndex].entryTime = entryTime;
+    logs[logIndex].exitTime = exitTime;
+    logIndex++;
+}
+
+void EXTI15_10_IRQHandler(void) {
+    if (EXTI->PR & EXTI_PR_PR10) {
+        EXTI->PR = EXTI_PR_PR10; // Clear interrupt flag for Pin 10
+        uint32_t RFID_ID = RFID_Read();
+        uint32_t entryTime = Timer_GetCurrentTime();
+
+        // Find an available parking spot
+        for (int i = 0; i < MAX_PARKING_SPOTS; i++) {
+            if (!parkingAvailability[i]) {
+                parkingAvailability[i] = 1; // Mark spot as occupied
+                logParkingData(RFID_ID, entryTime, 0);
+                break;
+            }
+        }
+    }
+
+    if (EXTI->PR & EXTI_PR_PR11) {
+        EXTI->PR = EXTI_PR_PR11; // Clear interrupt flag for Pin 11
+        uint32_t RFID_ID = RFID_Read();
+        uint32_t exitTime = Timer_GetCurrentTime();
+
+        // Find the corresponding log
+        for (int i = 0; i < logIndex; i++) {
+            if (logs[i].RFID_ID == RFID_ID && logs[i].exitTime == 0) {
+                logs[i].exitTime = exitTime;
+                parkingAvailability[i] = 0; // Mark spot as available
+                break;
+            }
+        }
+    }
+}
